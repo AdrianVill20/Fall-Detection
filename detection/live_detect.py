@@ -1,10 +1,9 @@
 """
 live_detect.py
-Live fall detection with:
-- Skeleton dot overlay
-- Partial body detection check
-- Rule-based geometry check on top of model prediction
-- Sound alert
+Live fall detection with velocity-based fall check.
+- Tracks how fast body keypoints move between frames
+- Sudden rapid movement = likely fall
+- Works for forward, backward, sideways falls
 Usage: python detection/live_detect.py
 Press Q to quit.
 """
@@ -21,6 +20,7 @@ import joblib
 import time
 import threading
 import numpy as np
+from collections import deque
 from utils.pose_utils import extract_features
 
 MODEL_PATH   = "model/fall_model.joblib"
@@ -29,18 +29,17 @@ CONFIRM_SECS = 3
 CAMERA_INDEX = 1
 
 REQUIRED_LANDMARKS   = [23, 24, 25, 26, 27, 28]
-VISIBILITY_THRESHOLD = 0.5
+VISIBILITY_THRESHOLD = 0.35
 
-# Fall geometry thresholds
-# height_ratio = |nose_y - ankle_y|
-# When standing: nose is far above ankles → large ratio (e.g. 0.6-0.9)
-# When fallen:   nose is near ankles → small ratio (e.g. 0.0-0.3)
-FALL_HEIGHT_RATIO_MAX = 0.35   # must be below this to count as fall
+# Velocity thresholds
+# Tracks average movement of key landmarks between frames
+# Normal movement: slow, controlled
+# Fall: sudden spike in movement
+VELOCITY_WINDOW    = 5     # frames to average velocity over
+VELOCITY_THRESHOLD = 0.03  # normalized units per frame; tune if needed
 
-# hip_shoulder_diff = |hip_y - shoulder_y|
-# When standing: hips are well below shoulders → large value
-# When fallen:   hips and shoulders at similar height → small value
-FALL_HIP_SHOULDER_MAX = 0.20   # must be below this to count as fall
+# Key landmarks to track for velocity (hips + shoulders + nose)
+VELOCITY_LANDMARKS = [0, 11, 12, 23, 24]
 
 SKELETON_CONNECTIONS = [
     (11, 12),
@@ -60,34 +59,31 @@ def is_full_body_visible(landmarks):
     return True
 
 
-def is_fallen_by_geometry(landmarks):
-    """
-    Returns True only if body geometry strongly suggests a fall.
-    This runs ON TOP of the model to reduce false positives.
-    """
-    nose_y      = landmarks[0].y
-    ankle_y     = (landmarks[27].y + landmarks[28].y) / 2
-    hip_y       = (landmarks[23].y + landmarks[24].y) / 2
-    shoulder_y  = (landmarks[11].y + landmarks[12].y) / 2
+def get_key_positions(landmarks):
+    """Get (x, y) of key landmarks as numpy array."""
+    return np.array([[landmarks[i].x, landmarks[i].y]
+                     for i in VELOCITY_LANDMARKS])
 
-    height_ratio      = abs(nose_y - ankle_y)
-    hip_shoulder_diff = abs(hip_y - shoulder_y)
 
-    fallen = (height_ratio < FALL_HEIGHT_RATIO_MAX and
-              hip_shoulder_diff < FALL_HIP_SHOULDER_MAX)
-    return fallen
+def compute_velocity(pos_history):
+    """Average movement magnitude over recent frames."""
+    if len(pos_history) < 2:
+        return 0.0
+    diffs = []
+    positions = list(pos_history)
+    for i in range(1, len(positions)):
+        diff = np.linalg.norm(positions[i] - positions[i-1], axis=1).mean()
+        diffs.append(diff)
+    return np.mean(diffs)
 
 
 def draw_skeleton(frame, landmarks, w, h):
     for a, b in SKELETON_CONNECTIONS:
-        ax = int(landmarks[a].x * w)
-        ay = int(landmarks[a].y * h)
-        bx = int(landmarks[b].x * w)
-        by = int(landmarks[b].y * h)
+        ax, ay = int(landmarks[a].x * w), int(landmarks[a].y * h)
+        bx, by = int(landmarks[b].x * w), int(landmarks[b].y * h)
         cv2.line(frame, (ax, ay), (bx, by), (0, 255, 255), 2)
     for lm in landmarks:
-        cx = int(lm.x * w)
-        cy = int(lm.y * h)
+        cx, cy = int(lm.x * w), int(lm.y * h)
         cv2.circle(frame, (cx, cy), 5, (0, 0, 255), -1)
         cv2.circle(frame, (cx, cy), 5, (255, 255, 255), 1)
 
@@ -95,12 +91,10 @@ def draw_skeleton(frame, landmarks, w, h):
 def play_beep():
     try:
         import sounddevice as sd
-        duration = 3.0
-        freq = 1000
-        sample_rate = 44100
-        t = np.linspace(0, duration, int(sample_rate * duration), False)
-        wave = 0.5 * np.sin(2 * np.pi * freq * t)
-        sd.play(wave.astype(np.float32), sample_rate)
+        sr = 44100
+        t  = np.linspace(0, 10.0, int(sr * 10.0), False)
+        w  = 0.5 * np.sin(2 * np.pi * 1000 * t)
+        sd.play(w.astype(np.float32), sr)
         sd.wait()
     except Exception as e:
         print(f"[Sound error] {e}")
@@ -124,6 +118,12 @@ def main():
     fall_start    = None
     alert_active  = False
     sound_playing = False
+    pos_history   = deque(maxlen=VELOCITY_WINDOW)
+
+    # Track whether a sudden movement was recently detected
+    sudden_move_detected = False
+    sudden_move_time     = 0
+
     print("Live detection running. Press Q to quit.")
 
     while True:
@@ -132,12 +132,13 @@ def main():
             break
 
         h, w = frame.shape[:2]
-        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        rgb      = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
-        result = detector.detect(mp_image)
+        result   = detector.detect(mp_image)
 
-        prediction    = 0
-        body_visible  = False
+        prediction   = 0
+        body_visible = False
+        velocity     = 0.0
 
         if result.pose_landmarks and len(result.pose_landmarks) > 0:
             landmarks = result.pose_landmarks[0]
@@ -145,14 +146,28 @@ def main():
 
             if is_full_body_visible(landmarks):
                 body_visible = True
-                features     = extract_features(landmarks)
-                model_pred   = clf.predict([features])[0]
-                geo_pred     = is_fallen_by_geometry(landmarks)
 
-                # BOTH model AND geometry must agree it's a fall
-                prediction = 1 if (model_pred == 1 and geo_pred) else 0
-            else:
-                body_visible = False
+                # Update velocity tracking
+                key_pos = get_key_positions(landmarks)
+                pos_history.append(key_pos)
+                velocity = compute_velocity(pos_history)
+
+                # Detect sudden movement spike
+                now = time.time()
+                if velocity > VELOCITY_THRESHOLD:
+                    sudden_move_detected = True
+                    sudden_move_time     = now
+
+                # Sudden move expires after 2 seconds
+                if now - sudden_move_time > 2.0:
+                    sudden_move_detected = False
+
+                # Get model prediction
+                features   = extract_features(landmarks)
+                model_pred = clf.predict([features])[0]
+
+                # Fall = model says fall AND there was a recent sudden movement
+                prediction = 1 if (model_pred == 1 and sudden_move_detected) else 0
 
         now = time.time()
 
@@ -162,6 +177,8 @@ def main():
             fall_start    = None
             alert_active  = False
             sound_playing = False
+            pos_history.clear()
+            sudden_move_detected = False
 
         elif not body_visible:
             cv2.putText(frame, "Unable to detect - show full body",
@@ -180,13 +197,17 @@ def main():
                 remaining = CONFIRM_SECS - elapsed
                 cv2.putText(frame, f"Fall? Confirming... {remaining:.1f}s",
                             (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 165, 255), 2)
-
         else:
             fall_start    = None
             alert_active  = False
             sound_playing = False
             cv2.putText(frame, "Status: Normal",
                         (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 200, 0), 2)
+
+        # Show velocity on screen for tuning
+        vel_color = (0, 0, 255) if velocity > VELOCITY_THRESHOLD else (0, 255, 0)
+        cv2.putText(frame, f"Velocity: {velocity:.4f}",
+                    (20, h - 20), cv2.FONT_HERSHEY_SIMPLEX, 0.6, vel_color, 1)
 
         if alert_active:
             overlay = frame.copy()

@@ -1,7 +1,7 @@
 """
 video_detect.py
 Fall detection on a video file using new MediaPipe API (0.10.x)
-Usage: python detection/video_detect.py path/to/video.avi
+Usage: python detection/video_detect.py path/to/video.mp4
 Press Q to quit.
 """
 
@@ -55,13 +55,17 @@ def main():
             break
         frame_num += 1
 
-        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        # Process every 2nd frame for speed on slow machines
+        if frame_num % 2 != 0:
+            continue
+
+        rgb      = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
-        result = detector.detect(mp_image)
+        result   = detector.detect(mp_image)
 
         prediction = 0
         if result.pose_landmarks and len(result.pose_landmarks) > 0:
-            features = extract_features(result.pose_landmarks[0])
+            features   = extract_features(result.pose_landmarks[0])
             prediction = clf.predict([features])[0]
 
         if prediction == 1:
@@ -74,7 +78,7 @@ def main():
                             (20, 60), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 165, 255), 2)
         else:
             fall_frame_count = 0
-            alert_active = False
+            alert_active     = False
 
         if alert_active:
             overlay = frame.copy()
@@ -89,7 +93,7 @@ def main():
                         (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 1.0, color, 2)
 
         cv2.imshow("Fall Detection - Video", frame)
-        if cv2.waitKey(int(1000 / fps)) & 0xFF == ord("q"):
+        if cv2.waitKey(1) & 0xFF == ord("q"):
             break
 
     cap.release()
